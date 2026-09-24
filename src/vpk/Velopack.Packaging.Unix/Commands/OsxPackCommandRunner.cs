@@ -20,7 +20,7 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
     }
 
     // Backport note: 1.2.0 predates the FluentValidation option validators, so the rules that develop keeps in
-    // OsxPackOptionsValidator are checked here, at the first step of the run.
+    // OsxPackOptionsValidator are checked in PreprocessPackDir instead.
     private void ValidateCrossPlatformOptions()
     {
         void Fail(string message) => throw new UserInfoException(message);
@@ -51,7 +51,6 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
 
     protected override string ExtractPackDir(string packDirectory)
     {
-        ValidateCrossPlatformOptions();
 
         if (packDirectory.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase)) {
             if (!OperatingSystem.IsMacOS()) {
@@ -70,6 +69,10 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
 
     protected override Task<string> PreprocessPackDir(Action<int> progress, string packDir)
     {
+        // The first step after PackageBuilder assigns Options (ExtractPackDir runs before it does), and still before
+        // anything is signed or packaged.
+        ValidateCrossPlatformOptions();
+
         var packTitle = Options.PackTitle ?? Options.PackId;
         var dir = TempDir.CreateSubdirectory(packTitle + ".app");
         bool deleteAppBundle = false;
