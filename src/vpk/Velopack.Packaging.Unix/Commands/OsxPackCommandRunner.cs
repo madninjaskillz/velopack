@@ -6,7 +6,12 @@ using Velopack.Util;
 
 namespace Velopack.Packaging.Unix.Commands;
 
-[SupportedOSPlatform("osx")]
+/// <summary>
+/// Builds macOS releases. On macOS it uses Apple's own tools throughout. Off macOS (Linux), it builds everything except
+/// the .pkg installer, which it refuses there, and signs and notarizes with rcodesign
+/// (<see cref="RcodesignTools"/>) when given a certificate file, zipping the portable bundle with
+/// <see cref="OsxPortableZip"/> in place of ditto.
+/// </summary>
 public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
 {
     public OsxPackCommandRunner(ILogger logger, IFancyConsole console)
@@ -14,9 +19,46 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
     {
     }
 
+    // Backport note: 1.2.0 predates the FluentValidation option validators, so the rules that develop keeps in
+    // OsxPackOptionsValidator are checked here, at the first step of the run.
+    private void ValidateCrossPlatformOptions()
+    {
+        void Fail(string message) => throw new UserInfoException(message);
+        bool mac = OperatingSystem.IsMacOS();
+        string macOnly(string option) =>
+            $"'{option}' uses Apple's codesign/notarytool, which only exist on macOS. Off macOS, sign and notarize with " +
+            "rcodesign instead: 'signP12File', 'signP12PasswordFile' and 'notaryApiKeyFile'.";
+
+        if (!String.IsNullOrEmpty(Options.SignP12File) && String.IsNullOrEmpty(Options.SignP12PasswordFile))
+            Fail("'signP12File' needs its password: pass 'signP12PasswordFile'.");
+        if (!String.IsNullOrEmpty(Options.SignP12File) && !String.IsNullOrEmpty(Options.SignAppIdentity))
+            Fail("Cannot use 'signAppIdentity' and 'signP12File' together: sign with the keychain (codesign) " +
+                 "or with a certificate file (rcodesign), not both.");
+        if (!String.IsNullOrEmpty(Options.NotaryApiKeyFile) && !String.IsNullOrEmpty(Options.NotaryProfile))
+            Fail("Cannot use 'notaryProfile' and 'notaryApiKeyFile' together, please choose one.");
+        if (!String.IsNullOrEmpty(Options.NotaryApiKeyFile) && String.IsNullOrEmpty(Options.SignP12File))
+            Fail("'notaryApiKeyFile' notarizes what rcodesign signed, so it needs 'signP12File' too.");
+        if (!mac) {
+            if (!String.IsNullOrEmpty(Options.SignAppIdentity)) Fail(macOnly("signAppIdentity"));
+            if (!String.IsNullOrEmpty(Options.SignInstallIdentity)) Fail(macOnly("signInstallIdentity"));
+            if (!String.IsNullOrEmpty(Options.NotaryProfile)) Fail(macOnly("notaryProfile"));
+            if (!String.IsNullOrEmpty(Options.Keychain)) Fail(macOnly("keychain"));
+            if (!Options.NoInst)
+                Fail("The .pkg installer is built with pkgbuild and productbuild, which only exist on macOS. " +
+                     "Off macOS, pass 'noInst': the release and the portable .app are built without it.");
+        }
+    }
+
     protected override string ExtractPackDir(string packDirectory)
     {
+        ValidateCrossPlatformOptions();
+
         if (packDirectory.EndsWith(".pkg", StringComparison.OrdinalIgnoreCase)) {
+            if (!OperatingSystem.IsMacOS()) {
+                throw new UserInfoException("Extracting an app bundle from a .pkg needs pkgutil, which only exists on macOS. " +
+                                            "Pass the .app bundle (or the folder to bundle) instead.");
+            }
+
             Log.Warn("Extracting application bundle from .pkg installer. This is not recommended for production use.");
             var dir = Path.Combine(TempDir.FullName, "pkg_extract");
             var helper = new OsxBuildTools(Log);
@@ -77,15 +119,81 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
 
     protected override Task CodeSign(Action<int> progress, string packDir)
     {
-        var helper = new OsxBuildTools(Log);
-        var keychainPath = Options.Keychain;
+        if (!String.IsNullOrEmpty(Options.SignP12File) && (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())) {
+            CodeSignWithRcodesign(progress, packDir);
+        } else if (OperatingSystem.IsMacOS()) {
+            CodeSignWithCodesign(progress, packDir);
+        } else {
+            Log.Warn("Package will not be signed or notarized, and Apple Silicon Macs will not run it unsigned. " +
+                     "Off macOS, sign and notarize with rcodesign: --signP12File, --signP12PasswordFile and --notaryApiKeyFile.");
+        }
 
+        return Task.CompletedTask;
+    }
+
+    [SupportedOSPlatform("macos")]
+    [SupportedOSPlatform("linux")]
+    private string GetEntitlements()
+    {
         string entitlements = Options.SignEntitlements;
         if (String.IsNullOrEmpty(entitlements)) {
             Log.Info("No entitlements specified, using default: " +
                      "https://docs.microsoft.com/dotnet/core/install/macos-notarization-issues");
             entitlements = HelperFile.VelopackEntitlements;
         }
+
+        return entitlements;
+    }
+
+    [SupportedOSPlatform("macos")]
+    [SupportedOSPlatform("linux")]
+    private void CodeSignWithRcodesign(Action<int> progress, string packDir)
+    {
+        RcodesignTools.AssertInstalled();
+        var rcodesign = new RcodesignTools(Log);
+        var entitlements = GetEntitlements();
+        var p12 = Options.SignP12File;
+        var password = Options.SignP12PasswordFile;
+        var updateMac = Path.Combine(new OsxStructureBuilder(packDir).MacosDirectory, "UpdateMac");
+
+        if (Options.SignDisableDeep) {
+            Log.Warn("Code signing with --signDisableDeep means that Velopack will only sign binaries it adds, " +
+                     "along with the final .app bundle. Please ensure all other binaries and frameworks are signed " +
+                     "properly before calling velopack.");
+
+            Log.Info("Code signing Velopack binaries (rcodesign)...");
+            rcodesign.SignFile(updateMac, p12, password, HelperFile.VelopackEntitlements);
+            progress(25);
+
+            Log.Info("Code signing application bundle (rcodesign)...");
+            rcodesign.SignBundleShallow(packDir, p12, password, entitlements);
+        } else {
+            // One call: rcodesign signs every nested bundle and Mach-O before sealing the bundle. UpdateMac keeps
+            // Velopack's own entitlements, as it does with --signDisableDeep; the app's go on the main executable.
+            Log.Info("Code signing application bundle recursively (rcodesign)...");
+            var scoped = new Dictionary<string, string> {
+                [Path.GetRelativePath(packDir, updateMac).Replace('\\', '/')] = HelperFile.VelopackEntitlements,
+            };
+            rcodesign.SignBundle(packDir, p12, password, entitlements, scoped);
+        }
+
+        progress(50);
+
+        if (!String.IsNullOrEmpty(Options.NotaryApiKeyFile)) {
+            rcodesign.NotarizeAndStaple(packDir, Options.NotaryApiKeyFile);
+        } else {
+            Log.Warn("Package will be signed but not notarized. Missing the --notaryApiKeyFile option.");
+        }
+
+        progress(100);
+    }
+
+    [SupportedOSPlatform("osx")]
+    private void CodeSignWithCodesign(Action<int> progress, string packDir)
+    {
+        var helper = new OsxBuildTools(Log);
+        var keychainPath = Options.Keychain;
+        var entitlements = GetEntitlements();
 
         void InnerSign(Action<int> signProgress)
         {
@@ -153,13 +261,13 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
         } else {
             Log.Warn("Package will not be signed or notarized. Missing the --signAppIdentity and --notaryProfile options.");
         }
-        return Task.CompletedTask;
     }
 
     protected override Task CreateSetupPackage(Action<int> progress, string releasePkg, string packDir, string pkgPath, Func<string, VelopackAssetType, string> createAsset)
     {
-        // create installer package, sign and notarize
-        if (!Options.NoInst) {
+        // create installer package, sign and notarize. Off macOS the options validator requires --noInst, because
+        // pkgbuild and productbuild do not exist there; this guard is the same rule, stated for the platform analyzer.
+        if (!Options.NoInst && OperatingSystem.IsMacOS()) {
             var helper = new OsxBuildTools(Log);
             Dictionary<string, string> pkgContent = new() {
                 {"welcome", Options.InstWelcome },
@@ -192,8 +300,13 @@ public class OsxPackCommandRunner : PackageBuilder<OsxPackOptions>
     protected override Task CreatePortablePackage(Action<int> progress, string packDir, string outputPath)
     {
         progress(-1); // indeterminate
-        var helper = new OsxBuildTools(Log);
-        helper.CreateDittoZip(packDir, outputPath);
+        if (OperatingSystem.IsMacOS()) {
+            var helper = new OsxBuildTools(Log);
+            helper.CreateDittoZip(packDir, outputPath);
+        } else {
+            OsxPortableZip.Create(Log, packDir, outputPath);
+        }
+
         progress(100);
         return Task.CompletedTask;
     }
