@@ -29,8 +29,11 @@ public class RcodesignTools
     }
 
     /// <summary>
-    /// Signs an .app bundle for distribution outside the App Store: Developer ID, hardened runtime and a secure timestamp
-    /// (rcodesign's --for-notarization), with <paramref name="appEntitlements"/> on the main executable.
+    /// Signs an .app bundle with the hardened runtime and a secure timestamp (rcodesign timestamps with Apple's server by
+    /// default), with <paramref name="appEntitlements"/> on the main executable. The same settings the codesign route
+    /// uses, and deliberately not rcodesign's --for-notarization, which additionally refuses any certificate that is not
+    /// an Apple-issued Developer ID: notarization enforces that anyway, and the check would stop a test certificate
+    /// from signing at all, which codesign allows.
     ///
     /// A bundle signature in rcodesign is always deep: it signs every nested bundle and every Mach-O in Contents/MacOS
     /// before sealing the bundle, as `codesign --deep` does. <paramref name="scopedEntitlements"/> gives individual
@@ -41,7 +44,7 @@ public class RcodesignTools
     {
         var args = new List<string> {
             "sign",
-            "--for-notarization",
+            "--code-signature-flags", "runtime",
             "--p12-file", p12File,
             "--p12-password-file", p12PasswordFile,
             // UNSCOPED, which applies to the bundle's main executable. Not "main:", which rcodesign's help describes as
@@ -74,7 +77,7 @@ public class RcodesignTools
     {
         var args = new List<string> {
             "sign",
-            "--for-notarization",
+            "--code-signature-flags", "runtime",
             "--p12-file", p12File,
             "--p12-password-file", p12PasswordFile,
             "--entitlements-xml-file", entitlements,
@@ -94,7 +97,7 @@ public class RcodesignTools
         var args = new List<string> {
             "sign",
             "--shallow",
-            "--for-notarization",
+            "--code-signature-flags", "runtime",
             "--p12-file", p12File,
             "--p12-password-file", p12PasswordFile,
             "--entitlements-xml-file", appEntitlements,
